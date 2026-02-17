@@ -1,0 +1,525 @@
+import logging
+import asyncio
+import os
+import time
+import json
+import datetime
+import traceback
+import mimetypes
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
+import config
+from core.agent import Agent
+from core.tools import ToolRegistry
+from core.watcher import ModuleWatcher
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+
+# Initialize Tools
+registry = ToolRegistry()
+registry.load_modules()
+
+# Initialize Watcher
+watcher = ModuleWatcher(registry)
+watcher.start()
+
+# Initialize Agent
+agent = Agent(registry)
+
+# Persistence
+SESSIONS_FILE = "data/sessions.json"
+PROFILE_FILE = "data/profiles.json"
+DOWNLOADS_DIR = "downloads"
+
+
+def ensure_downloads_dir():
+    if not os.path.exists(DOWNLOADS_DIR):
+        os.makedirs(DOWNLOADS_DIR)
+
+
+ensure_downloads_dir()
+
+
+def load_sessions():
+    if os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+
+def save_sessions():
+    if not os.path.exists("data"):
+        os.makedirs("data")
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(user_sessions, f)
+
+
+def load_profiles():
+    if os.path.exists(PROFILE_FILE):
+        try:
+            with open(PROFILE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+
+# In-memory session storage (loaded from file)
+user_sessions = load_sessions()
+user_profiles = load_profiles()
+session_lock = asyncio.Lock()
+
+# Task management for stopping
+running_tasks = {}
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    async with session_lock:
+        user_sessions[chat_id] = []
+        save_sessions()
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Hello! I am your AI assistant. I can help you with tasks, manage your diary, and more.",
+    )
+
+
+async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    async with session_lock:
+        user_sessions[chat_id] = []
+        save_sessions()
+    await context.bot.send_message(chat_id=chat_id, text="Memory cleared.")
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    if chat_id in running_tasks:
+        task = running_tasks[chat_id]
+        if not task.done():
+            task.cancel()
+            await context.bot.send_message(chat_id=chat_id, text="Stopped.")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="Nothing is running.")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="Nothing is running.")
+
+
+async def save_user_file(file_obj, chat_id, original_filename=None):
+    """Downloads a file and returns the local path."""
+    timestamp = int(time.time())
+
+    # Create user-specific dir inside downloads
+    user_dir = os.path.join(DOWNLOADS_DIR, str(chat_id))
+    if not os.path.exists(user_dir):
+        os.makedirs(user_dir)
+
+    if original_filename:
+        filename = f"{timestamp}_{original_filename}"
+    else:
+        # Generate generic name if not provided
+        ext = ".bin"
+        if hasattr(file_obj, "file_path") and file_obj.file_path:
+            _, ext = os.path.splitext(file_obj.file_path)
+        filename = f"{timestamp}_file{ext}"
+
+    filepath = os.path.join(user_dir, filename)
+    await file_obj.download_to_drive(filepath)
+    return filepath
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text
+    chat_id = str(update.effective_chat.id)
+
+    # Cancel previous task if running
+    if chat_id in running_tasks:
+        task = running_tasks[chat_id]
+        if not task.done():
+            task.cancel()
+
+    # Create new task
+    task = asyncio.create_task(process_agent_loop(chat_id, user_input, context))
+    running_tasks[chat_id] = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logging.error(f"Task failed: {e}")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id, text="Receiving voice message..."
+    )
+
+    try:
+        file = await update.message.voice.get_file()
+        filepath = await save_user_file(file, chat_id, f"voice.ogg")
+
+        caption = update.message.caption or ""
+
+        # Add file context to history immediately
+        async with session_lock:
+            if chat_id not in user_sessions:
+                user_sessions[chat_id] = []
+            user_sessions[chat_id].append(
+                {
+                    "role": "user",
+                    "content": f"[Voice file uploaded to {filepath}]. Caption: {caption}",
+                }
+            )
+            save_sessions()
+
+        # Trigger Agent
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            text="Voice received. Transcribing...",
+        )
+
+        prompt = "Please transcribe this voice message."
+        if caption:
+            prompt += f" Context: {caption}"
+
+        if chat_id in running_tasks:
+            task = running_tasks[chat_id]
+            if not task.done():
+                task.cancel()
+
+        task = asyncio.create_task(process_agent_loop(chat_id, prompt, context))
+        running_tasks[chat_id] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"Error processing voice: {str(e)}"
+        )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+
+    # Handle multiple photos (media groups) properly by just logging them and letting agent pick up
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        filepath = await save_user_file(file, chat_id, f"image.jpg")
+
+        caption = update.message.caption or ""
+
+        async with session_lock:
+            if chat_id not in user_sessions:
+                user_sessions[chat_id] = []
+            user_sessions[chat_id].append(
+                {
+                    "role": "user",
+                    "content": f"[Image uploaded to {filepath}]. Caption: {caption}",
+                }
+            )
+            save_sessions()
+
+        # Trigger Agent
+        # If part of an album, subsequent triggers might cancel this one, but history is saved.
+        # We rely on the last trigger to process all recent images.
+
+        prompt = "Analyze this image."
+        if caption:
+            prompt = caption  # Use caption as the prompt if provided
+
+        # Optional: Check if we are already processing (simple debounce)
+        # But cancellation handles this. The last image in a burst will trigger the final analysis.
+
+        if chat_id in running_tasks:
+            task = running_tasks[chat_id]
+            if not task.done():
+                task.cancel()
+
+        # Send status only if no recent status exists?
+        # Actually, let's just send a temp message that gets edited by agent loop
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id, text="Image received. Analyzing..."
+        )
+
+        # We need to pass the status_msg ID to process_agent_loop so it can edit it.
+        # But process_agent_loop creates its own "Thinking..." message.
+        # Let's delete our temp message to avoid clutter or let agent overwrite.
+        # Better: Modify process_agent_loop to accept an existing message object to edit?
+        # For simplicity, we just delete our temp message and let agent create its own.
+        await context.bot.delete_message(
+            chat_id=chat_id, message_id=status_msg.message_id
+        )
+
+        task = asyncio.create_task(process_agent_loop(chat_id, prompt, context))
+        running_tasks[chat_id] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"Error processing image: {str(e)}"
+        )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    try:
+        doc = update.message.document
+        file = await doc.get_file()
+        filepath = await save_user_file(file, chat_id, doc.file_name)
+
+        caption = update.message.caption or ""
+
+        async with session_lock:
+            if chat_id not in user_sessions:
+                user_sessions[chat_id] = []
+            user_sessions[chat_id].append(
+                {
+                    "role": "user",
+                    "content": f"[File uploaded to {filepath}]. Caption: {caption}",
+                }
+            )
+            save_sessions()
+
+        prompt = "Analyze this file."
+        if caption:
+            prompt = caption
+
+        if chat_id in running_tasks:
+            task = running_tasks[chat_id]
+            if not task.done():
+                task.cancel()
+
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id, text="File received. Processing..."
+        )
+        await context.bot.delete_message(
+            chat_id=chat_id, message_id=status_msg.message_id
+        )
+
+        task = asyncio.create_task(process_agent_loop(chat_id, prompt, context))
+        running_tasks[chat_id] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"Error processing file: {str(e)}"
+        )
+
+
+async def process_agent_loop(chat_id, user_input, context):
+    chat_id_str = str(chat_id)
+
+    async with session_lock:
+        if chat_id_str not in user_sessions:
+            user_sessions[chat_id_str] = []
+
+        # Limit history
+        if len(user_sessions[chat_id_str]) > 20:
+            user_sessions[chat_id_str] = user_sessions[chat_id_str][-20:]
+
+        # Shallow copy of CLEAN history (before this turn)
+        session_history_start = list(user_sessions[chat_id_str])
+
+    # Copy for agent to modify during this turn
+    current_history = list(session_history_start)
+
+    # REMOVED: Profile Context Injection
+    # user_profile = user_profiles.get(chat_id_str, {})
+    # ...
+    # if profile_context:
+    #    current_history.insert(0, ...)
+
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="Thinking...")
+    last_status = ""
+    final_response = ""
+    streamed_text = ""
+    last_edit_time = 0
+
+    tool_ctx = {
+        "bot": context.bot,
+        "chat_id": chat_id,
+        "job_queue": context.job_queue,
+        "registry": registry,
+        "agent_runner": scheduled_task_callback,  # Pass global callback
+    }
+
+    # Helper to edit message safely with rate limiting and splitting
+    async def safe_edit(text, force=False):
+        nonlocal last_edit_time, last_status
+        current_time = time.time()
+
+        if not force and (current_time - last_edit_time < 3.0):
+            return
+
+        if text == last_status:
+            return
+
+        # Split text if too long for streaming (truncate to last 4000)
+        max_len = 4000
+        display_text = text
+        if len(display_text) > max_len:
+            display_text = "... " + display_text[-(max_len - 5) :]
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                text=display_text,
+                parse_mode=None,
+            )
+            last_status = text
+            last_edit_time = current_time
+        except Exception as e:
+            logging.warning(f"safe_edit error (non-fatal): {e}")
+
+    try:
+        async for update_data in agent.run(
+            user_input, history=current_history, tool_context=tool_ctx
+        ):
+            status = update_data.get("status")
+
+            if status == "thinking":
+                msg = f"Thinking: {update_data.get('message', '...')}"
+                await safe_edit(msg)
+
+            elif status == "tool_use":
+                tool_name = update_data.get("tool")
+                msg = f"Executing: {tool_name}..."
+                await safe_edit(msg)
+
+            elif status == "final_stream":
+                content = update_data.get("content")
+                streamed_text += content
+                await safe_edit(streamed_text + " ▌")
+
+            elif status == "final":
+                final_response = update_data.get("content")
+
+    except asyncio.CancelledError:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=status_msg.message_id, text="Stopped."
+        )
+        return
+    except Exception as e:
+        final_response = f"Error in agent loop: {str(e)}"
+        logging.error(f"Agent loop error: {e}")
+
+    if final_response:
+        # Split final response if too long - use smaller chunk for Markdown safety
+        max_len = 4000
+        if len(final_response) > max_len:
+            chunks = [
+                final_response[i : i + max_len]
+                for i in range(0, len(final_response), max_len)
+            ]
+
+            try:
+                # Try sending first chunk with Markdown
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id,
+                    text=chunks[0],
+                    parse_mode="Markdown",
+                )
+            except:
+                try:
+                    # Fallback to plain text
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg.message_id,
+                        text=chunks[0],
+                    )
+                except:
+                    await context.bot.send_message(chat_id=chat_id, text=chunks[0])
+
+            for chunk in chunks[1:]:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=chunk, parse_mode="Markdown"
+                    )
+                except:
+                    await context.bot.send_message(chat_id=chat_id, text=chunk)
+        else:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id,
+                    text=final_response,
+                    parse_mode="Markdown",
+                )
+            except:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg.message_id,
+                        text=final_response,
+                    )
+                except:
+                    await context.bot.send_message(chat_id=chat_id, text=final_response)
+
+    # GARBAGE COLLECTION:
+    # Update user_sessions with the new CLEAN interaction (User + Final Answer), discarding tools.
+    if final_response:
+        new_history = list(session_history_start)
+        new_history.append({"role": "user", "content": user_input})
+        new_history.append({"role": "assistant", "content": final_response})
+
+        async with session_lock:
+            user_sessions[chat_id_str] = new_history
+            save_sessions()
+
+
+async def scheduled_task_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Callback for scheduled recurring tasks."""
+    job = context.job
+    chat_id = job.chat_id
+    prompt = job.data  # The prompt to run, e.g., "Check weather"
+
+    await context.bot.send_message(chat_id=chat_id, text=f"⏰ Scheduled Task: {prompt}")
+
+    # Run agent loop
+    # Note: We need to ensure we don't block the job queue worker too long.
+    # process_agent_loop creates user session history, sends messages, etc.
+    # It requires 'context' to have .bot and .job_queue. The passed 'context' has it.
+    await process_agent_loop(chat_id, prompt, context)
+
+
+if __name__ == "__main__":
+    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear", clear_memory))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    )
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    print("Bot is running...")
+    application.run_polling()
