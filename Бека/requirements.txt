@@ -6,7 +6,4 @@ beautifulsoup4
 schedule
 pydub
 watchdog
-chromadb
 tavily-python
-tiktoken
-sentence-transformers

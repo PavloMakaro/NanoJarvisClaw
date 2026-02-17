@@ -6,7 +6,6 @@ import json
 import datetime
 import traceback
 import mimetypes
-import tiktoken
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -84,15 +83,8 @@ user_usage = {} # Session token usage
 session_lock = asyncio.Lock()
 
 # Token Encoder
-try:
-    enc = tiktoken.get_encoding("cl100k_base")
-except:
-    enc = None
-
 def count_tokens(text):
     if not text: return 0
-    if enc:
-        return len(enc.encode(str(text)))
     return len(str(text)) // 4
 
 # Task management for stopping
