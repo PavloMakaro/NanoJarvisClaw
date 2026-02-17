@@ -5,5 +5,8 @@ openai
 beautifulsoup4
 schedule
 pydub
-duckduckgo-search
 watchdog
+chromadb
+tavily-python
+tiktoken
+sentence-transformers
