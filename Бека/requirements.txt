@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue]
+requests
+yt-dlp
+openai
+beautifulsoup4
+schedule
+pydub
+duckduckgo-search
+watchdog
