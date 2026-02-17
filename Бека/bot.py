@@ -6,6 +6,7 @@ import json
 import datetime
 import traceback
 import mimetypes
+import tiktoken
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -79,10 +80,41 @@ def load_profiles():
 # In-memory session storage (loaded from file)
 user_sessions = load_sessions()
 user_profiles = load_profiles()
+user_usage = {} # Session token usage
 session_lock = asyncio.Lock()
+
+# Token Encoder
+try:
+    enc = tiktoken.get_encoding("cl100k_base")
+except:
+    enc = None
+
+def count_tokens(text):
+    if not text: return 0
+    if enc:
+        return len(enc.encode(str(text)))
+    return len(str(text)) // 4
 
 # Task management for stopping
 running_tasks = {}
+
+async def summarize_history(history_slice):
+    """Summarizes a slice of conversation history."""
+    try:
+        prompt = "Summarize the following conversation concisely in 2-3 sentences, preserving key facts and context:"
+        msgs = [{"role": "system", "content": prompt}]
+        for m in history_slice:
+            role = m.get("role", "unknown")
+            content = m.get("content", "")
+            msgs.append({"role": "user", "content": f"{role}: {content}"})
+
+        # Use agent's LLM non-streaming
+        response_msg = await agent.llm.generate(msgs, stream=False)
+        if response_msg and response_msg.content:
+            return response_msg.content
+    except Exception as e:
+        logging.error(f"Summarization failed: {e}")
+    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -333,15 +365,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_agent_loop(chat_id, user_input, context):
     chat_id_str = str(chat_id)
 
+    # 1. Check Usage Quota
+    current_usage = user_usage.get(chat_id_str, 0)
+    if current_usage > 50000:
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Session usage quota exceeded (50,000 tokens). Please use /clear to reset.")
+        return
+
     async with session_lock:
         if chat_id_str not in user_sessions:
             user_sessions[chat_id_str] = []
 
-        # Limit history
-        if len(user_sessions[chat_id_str]) > 20:
-            user_sessions[chat_id_str] = user_sessions[chat_id_str][-20:]
+        # 2. Smart Context Summarization
+        hist = user_sessions[chat_id_str]
+        # Calculate roughly
+        total_tokens = sum(count_tokens(m.get("content", "")) for m in hist)
 
-        # Shallow copy of CLEAN history (before this turn)
+        # If history is too long ( > 15 messages OR > 4000 tokens)
+        if len(hist) > 15 or total_tokens > 4000:
+            # We want to keep the last 5 messages intact
+            if len(hist) > 6:
+                to_summarize = hist[:-6]
+                kept_history = hist[-6:]
+
+                # Send temporary status
+                status_msg = await context.bot.send_message(chat_id=chat_id, text="🔄 Optimizing memory...")
+
+                summary = await summarize_history(to_summarize)
+
+                if summary:
+                    # Replace old history with summary + recent
+                    new_hist = [{"role": "system", "content": f"[Previous Conversation Summary]: {summary}"}] + kept_history
+                    user_sessions[chat_id_str] = new_hist
+                    save_sessions()
+                    logging.info(f"Summarized history for {chat_id_str}")
+
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+
+        # Shallow copy of CLEAN history
         session_history_start = list(user_sessions[chat_id_str])
 
     # Copy for agent to modify during this turn
@@ -481,9 +541,16 @@ async def process_agent_loop(chat_id, user_input, context):
                 except:
                     await context.bot.send_message(chat_id=chat_id, text=final_response)
 
-    # GARBAGE COLLECTION:
-    # Update user_sessions with the new CLEAN interaction (User + Final Answer), discarding tools.
+    # GARBAGE COLLECTION & USAGE TRACKING:
     if final_response:
+        # Update usage
+        input_tokens = count_tokens(user_input)
+        output_tokens = count_tokens(final_response)
+        # Add rough estimate for system prompt and tools
+        turn_usage = input_tokens + output_tokens + 500
+        user_usage[chat_id_str] = user_usage.get(chat_id_str, 0) + turn_usage
+
+        # Update history
         new_history = list(session_history_start)
         new_history.append({"role": "user", "content": user_input})
         new_history.append({"role": "assistant", "content": final_response})

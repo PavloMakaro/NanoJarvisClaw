@@ -117,6 +117,9 @@ class Agent:
 
             # 2. Check for Tool Call
             if tool_calls_buffer:
+                tasks = []
+                calls_metadata = []
+
                 for tool_call in tool_calls_buffer:
                     func_name = tool_call["function"]["name"]
                     args_str = tool_call["function"]["arguments"]
@@ -128,21 +131,36 @@ class Agent:
                         args = {} # Or handle error
 
                     yield {"status": "tool_use", "tool": func_name, "args": args}
+                    calls_metadata.append({"id": call_id, "name": func_name})
 
-                    # Execute Tool
-                    try:
-                        if self.tools.is_async(func_name):
-                            coro = self.tools.execute(func_name, tool_context=tool_context, **args)
-                            if asyncio.iscoroutine(coro):
-                                result = await coro
+                    # Prepare execution wrapper
+                    async def execute_tool_safe(name, arguments):
+                        try:
+                            if self.tools.is_async(name):
+                                res = self.tools.execute(name, tool_context=tool_context, **arguments)
+                                if asyncio.iscoroutine(res):
+                                    return await res
+                                return res
                             else:
-                                result = coro
-                        else:
-                            result = await asyncio.to_thread(self.tools.execute, func_name, tool_context=tool_context, **args)
+                                return await asyncio.to_thread(self.tools.execute, name, tool_context=tool_context, **arguments)
+                        except Exception as e:
+                            return f"Error executing tool '{name}': {str(e)}"
 
+                    tasks.append(execute_tool_safe(func_name, args))
+
+                # Parallel Execution
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process Results
+                for i, result in enumerate(results):
+                    meta = calls_metadata[i]
+                    func_name = meta["name"]
+                    call_id = meta["id"]
+
+                    if isinstance(result, Exception):
+                        result_str = f"Error: {str(result)}"
+                    else:
                         result_str = str(result)
-                    except Exception as e:
-                        result_str = f"Error: {str(e)}"
 
                     # CROP RESULT (Observation)
                     if len(result_str) > 2000:
